@@ -210,7 +210,7 @@ for key, default in [
     ("datos_base", None),
     ("tabla_teorica", pd.DataFrame()),
     ("opciones_mapeadas", {}),
-    ("comparaciones", {}),  # dict keyed por ID de opción -> resultado evaluado
+    ("comparaciones", {}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -288,6 +288,23 @@ if st.session_state.ticker_confirmado:
     ) / 100
     st.session_state.datos_base["div_yield"] = div_yield_editado
 
+    precio_medio_entrada = st.number_input(
+        f"Tu precio medio de entrada de estas acciones ({d['divisa']})",
+        min_value=0.0,
+        value=st.session_state.datos_base.get("precio_medio_entrada") or round(d["precio"], 2),
+        step=0.01, format="%.2f",
+        help="El coste real al que compraste las acciones. El resultado total de cada "
+             "operación (si te asignan) se calcula contra ESTE precio, no contra el precio "
+             "actual de mercado — es lo que de verdad importa para tu cartera.",
+    )
+    st.session_state.datos_base["precio_medio_entrada"] = precio_medio_entrada
+
+    plusvalia_latente_pct = (d["precio"] - precio_medio_entrada) / precio_medio_entrada * 100 if precio_medio_entrada > 0 else 0
+    st.caption(
+        f"Plusvalía/minusvalía latente sobre la acción: **{plusvalia_latente_pct:+.2f}%** "
+        f"(precio actual {d['precio']:.2f} vs. entrada {precio_medio_entrada:.2f} {d['divisa']})"
+    )
+
 # ==============================================================================
 # UI — 2. PARÁMETROS Y MATRIZ TEÓRICA
 # ==============================================================================
@@ -313,24 +330,48 @@ if st.session_state.ticker_confirmado:
         meses_evaluar = [meses_disponibles[etiquetas_meses.index(s)] for s in seleccion_meses]
     with c3:
         precio_actual = st.session_state.datos_base["precio"]
-        base_strike = round(precio_actual * 2) / 2
-        # Rango amplio de candidatos en pasos de 0.5, el usuario elige cuáles evaluar
-        strikes_candidatos = [round(base_strike + i * 0.5, 2) for i in range(-6, 17)]
-        strikes_default = [round(base_strike + i * 0.5, 2) for i in range(-1, 5)]
+        base_strike = round(precio_actual * 4) / 4  # redondeo al 0.25 más cercano
+        # Rango amplio de candidatos en pasos de 0.25, el usuario elige cuáles evaluar
+        strikes_candidatos = [round(base_strike + i * 0.25, 2) for i in range(-12, 33)]
+        strikes_default = [round(base_strike + i * 0.25, 2) for i in range(-2, 9)]
         strikes_seleccionados = st.multiselect(
-            "Strikes a evaluar (pasos de 0.5)",
+            "Strikes a evaluar (pasos de 0.25)",
             strikes_candidatos,
             default=[s for s in strikes_default if s in strikes_candidatos],
-            help="Nota: estos strikes son una rejilla sintética de 0.5 en 0.5, no la cadena real "
+            help="Nota: estos strikes son una rejilla sintética de 0.25 en 0.25, no la cadena real "
                  "de tu bróker (punto #8 pendiente). Solo se calculan los que estén por encima "
                  "del precio actual (fuera de dinero).",
         )
+
+    with st.expander("Comisiones DEGIRO (revisa/ajusta si han cambiado)", expanded=False):
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            comision_apertura = st.number_input(
+                "Comisión por contrato al vender la call (€)",
+                min_value=0.0, value=0.75, step=0.05, format="%.2f",
+                help="Confirmado: opciones/futuros MEFF a 0,75€/contrato (tarifa vigente en 2026). "
+                     "Revisa la página de tarifas de DEGIRO si operas en otro mercado.",
+            )
+        with cc2:
+            comision_asignacion = st.number_input(
+                "Comisión por ejercicio/asignación (€/contrato)",
+                min_value=0.0, value=1.00, step=0.05, format="%.2f",
+                help="DEGIRO cobra 1€/contrato si la opción se ejerce, se asigna o se liquida en "
+                     "efectivo. Se aplica solo en el escenario 'Si Asignado', no en 'Si Vence Sin Valor'.",
+            )
 
     if st.button("Calcular matriz teórica") and meses_evaluar and strikes_seleccionados:
         try:
             d = st.session_state.datos_base
             precio_actual = d["precio"]
+            precio_entrada = d.get("precio_medio_entrada") or precio_actual
             fecha_hoy = date.today()
+
+            # Rend. % Total Si Asignado se calcula por 1 contrato (100 acciones): al ser
+            # comisión fija por contrato y capital/resultado proporcionales a las acciones,
+            # el % apenas varía con el nº de contratos reales — para la cifra exacta sobre
+            # TU posición, usa la tabla de comparación (paso 3).
+            comision_asignado_1c = comision_apertura + comision_asignacion
 
             strikes_omitidos_itm = []
             filas = []
@@ -356,6 +397,14 @@ if st.session_state.ticker_confirmado:
                     )
                     rend_anualizado = (precio_teorico / precio_actual) * (365.0 / dias_restantes) * 100.0
 
+                    resultado_asignado_teorico = (
+                        (strike - precio_entrada) * 100 + precio_teorico * 100 - comision_asignado_1c
+                    )
+                    capital_1c = precio_entrada * 100
+                    rend_asignado_teorico_pct = (
+                        resultado_asignado_teorico / capital_1c * 100 if capital_1c > 0 else None
+                    )
+
                     filas.append({
                         "ID": contador_id,
                         "Vencimiento": fecha_venc.strftime("%d-%b-%Y"),
@@ -364,6 +413,9 @@ if st.session_state.ticker_confirmado:
                         "Dist. OTM %": round(distancia_otm, 2),
                         "Teórico BS": round(precio_teorico, 3),
                         "Rend. Anualizado %": round(rend_anualizado, 2),
+                        "Rend. % Total Si Asignado (teórico)": (
+                            round(rend_asignado_teorico_pct, 2) if rend_asignado_teorico_pct is not None else None
+                        ),
                     })
                     opciones_mapeadas[contador_id] = {
                         "vencimiento": fecha_venc.strftime("%d-%b-%Y"),
@@ -417,27 +469,6 @@ if st.session_state.opciones_mapeadas:
     with c3:
         precio_broker = st.number_input("Prima real de DeGiro", min_value=0.0, value=0.0, step=0.01, format="%.3f")
 
-    with st.expander("Comisiones DEGIRO (revisa/ajusta si han cambiado)"):
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            comision_apertura = st.number_input(
-                "Comisión por contrato al vender la call (€)",
-                min_value=0.0, value=0.75, step=0.05, format="%.2f",
-                help="Confirmado: opciones/futuros MEFF a 0,75€/contrato (tarifa vigente en 2026). "
-                     "Revisa la página de tarifas de DEGIRO si operas en otro mercado.",
-            )
-        with cc2:
-            comision_asignacion = st.number_input(
-                "Comisión por ejercicio/asignación (€/contrato)",
-                min_value=0.0, value=1.00, step=0.05, format="%.2f",
-                help="DEGIRO cobra 1€/contrato si la opción se ejerce, se asigna o se liquida en "
-                     "efectivo. No aplica si la call vence sin valor.",
-            )
-        incluir_asignacion = st.checkbox(
-            "Incluir comisión de asignación en el ingreso neto (asume escenario de asignación)",
-            value=False,
-        )
-
     contratos = num_acciones // 100
 
     if 0 < num_acciones < 100:
@@ -472,41 +503,62 @@ if st.session_state.opciones_mapeadas:
         teorico = datos_opc["teorico"]
         precio_actual = d["precio"]
         vol_historica = d["vol"]
+        precio_entrada = d.get("precio_medio_entrada") or precio_actual
 
         rend_real = (precio_broker / precio_actual) * (365.0 / dias) * 100.0
-        comision_total = comision_apertura * contratos
-        if incluir_asignacion:
-            comision_total += comision_asignacion * contratos
-        ingreso_neto = (precio_broker * 100 * contratos) - comision_total
+        comision_total_base = comision_apertura * contratos
+        ingreso_neto_prima = (precio_broker * 100 * contratos) - comision_total_base
 
-        # Volatilidad implícita despejada de TU prima real (punto #6): sustituye el
-        # "edge vs. teórico histórico" (sesgado, casi siempre positivo por la prima
-        # de riesgo de volatilidad) por un dato informativo real: qué volatilidad
-        # está pagando el mercado ahora mismo, comparada con la histórica.
+        # --- Resultado total por escenario, contra TU precio medio de entrada ---
+        acciones_cubiertas = contratos * 100
+        strike = datos_opc["strike"]
+
+        # Escenario A: vence sin valor. Te quedas las acciones + la prima. No hay comisión
+        # de asignación.
+        resultado_vence_sin_valor = ingreso_neto_prima
+        capital_en_juego = precio_entrada * acciones_cubiertas
+        rend_vence_sin_valor_pct = (
+            resultado_vence_sin_valor / capital_en_juego * 100 if capital_en_juego > 0 else None
+        )
+
+        # Escenario B: te asignan. Vendes las acciones al strike (ganancia/pérdida vs. tu
+        # precio de entrada) + cobras la prima - comisión de apertura - comisión de asignación.
+        comision_total_asignado = comision_apertura * contratos + comision_asignacion * contratos
+        plusvalia_accion = (strike - precio_entrada) * acciones_cubiertas
+        resultado_asignado = plusvalia_accion + (precio_broker * 100 * contratos) - comision_total_asignado
+        rend_asignado_pct = (
+            resultado_asignado / capital_en_juego * 100 if capital_en_juego > 0 else None
+        )
+
+        # Volatilidad implícita despejada de TU prima real (punto #6): referencia informativa,
+        # qué volatilidad está pagando el mercado ahora mismo comparada con la histórica.
+        # (Nota: en escala € es la misma comparación que precio_real vs. teórico — no es una
+        # señal de compra/venta nueva, solo la misma información en otras unidades.)
         tiempo_anos = dias / 365.0
         iv = volatilidad_implicita_desde_precio(
-            precio_broker, precio_actual, datos_opc["strike"], tiempo_anos,
+            precio_broker, precio_actual, strike, tiempo_anos,
             tasa_libre_riesgo, d["div_yield"],
         )
-        prima_riesgo_vol = (iv - vol_historica) * 100 if iv is not None else None
 
         # Clave única: misma opción con distinto nº de acciones/prima se trata como
         # entradas separadas para poder comparar escenarios sobre el mismo strike.
-        clave = f"{id_sel}_{num_acciones}_{precio_broker}_{incluir_asignacion}"
+        clave = f"{id_sel}_{num_acciones}_{precio_broker}_{precio_entrada}"
         st.session_state.comparaciones[clave] = {
             "ID": id_sel,
             "Vencimiento": datos_opc["vencimiento"],
             "Días": dias,
             "Strike": datos_opc["strike"],
             "Dist. OTM %": round(datos_opc["otm"], 2),
+            "Precio Entrada": round(precio_entrada, 2),
             "Teórico BS (vol. hist.)": round(teorico, 3),
             "Prima Real": round(precio_broker, 3),
             "Rend. Anualizado Real %": round(rend_real, 2),
             "IV Implícita %": round(iv * 100, 2) if iv is not None else None,
-            "Vol. Histórica %": round(vol_historica * 100, 2),
-            "Prima Riesgo Vol. %": round(prima_riesgo_vol, 2) if prima_riesgo_vol is not None else None,
             "Contratos": contratos,
-            "Ingreso Neto": round(ingreso_neto, 2),
+            "Result. Si Vence Sin Valor": round(resultado_vence_sin_valor, 2),
+            "Rend. % Si Vence Sin Valor": round(rend_vence_sin_valor_pct, 2) if rend_vence_sin_valor_pct is not None else None,
+            "Result. Total Si Asignado": round(resultado_asignado, 2),
+            "Rend. % Total Si Asignado": round(rend_asignado_pct, 2) if rend_asignado_pct is not None else None,
         }
         if iv is None:
             st.warning(
@@ -518,34 +570,36 @@ if st.session_state.opciones_mapeadas:
     if st.session_state.comparaciones:
         st.subheader("Comparación de operaciones evaluadas")
         df_comp = pd.DataFrame(list(st.session_state.comparaciones.values()))
-        df_comp = df_comp.sort_values("Rend. Anualizado Real %", ascending=False).reset_index(drop=True)
+        df_comp = df_comp.sort_values("Rend. % Total Si Asignado", ascending=False, na_position="last").reset_index(drop=True)
         st.dataframe(
             df_comp,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Rend. Anualizado Real %": st.column_config.ProgressColumn(
-                    "Rend. Anualizado Real %",
-                    min_value=0,
-                    max_value=max(30.0, float(df_comp["Rend. Anualizado Real %"].max())),
+                "Rend. % Total Si Asignado": st.column_config.ProgressColumn(
+                    "Rend. % Total Si Asignado",
+                    min_value=min(0.0, float(df_comp["Rend. % Total Si Asignado"].min(skipna=True) or 0)),
+                    max_value=max(10.0, float(df_comp["Rend. % Total Si Asignado"].max(skipna=True) or 10)),
                     format="%.2f%%",
                 ),
             },
         )
         st.caption(
-            "**Prima Riesgo Vol. %** = IV implícita (despejada de tu prima real) menos volatilidad "
-            "histórica. Suele ser positiva de forma estructural (el mercado casi siempre cobra algo "
-            "extra sobre la volatilidad pasada) — no la interpretes por sí sola como 'oportunidad', "
-            "es contexto, no una señal de compra/venta."
+            "Los dos escenarios están calculados contra tu **precio medio de entrada**, no contra "
+            "el precio actual de mercado — reflejan el resultado real sobre tu cartera. "
+            "'IV Implícita' es solo referencia informativa (volatilidad que paga el mercado ahora "
+            "mismo según tu prima real), no una señal de compra/venta."
         )
 
         mejor = df_comp.iloc[0]
-        st.success(
-            f"Mejor rendimiento anualizado real: **ID {mejor['ID']}** "
-            f"({mejor['Vencimiento']}, strike {mejor['Strike']:.2f}) con {mejor['Rend. Anualizado Real %']:.2f}%"
-        )
+        if pd.notna(mejor["Rend. % Total Si Asignado"]):
+            st.success(
+                f"Mejor resultado total si asignan: **ID {mejor['ID']}** "
+                f"({mejor['Vencimiento']}, strike {mejor['Strike']:.2f}) "
+                f"con {mejor['Rend. % Total Si Asignado']:.2f}% sobre tu precio de entrada"
+            )
 
-        st.bar_chart(df_comp.set_index("ID")["Rend. Anualizado Real %"])
+        st.bar_chart(df_comp.set_index("ID")[["Rend. % Si Vence Sin Valor", "Rend. % Total Si Asignado"]])
 else:
     if st.session_state.ticker_confirmado:
         st.info("Calcula primero la matriz teórica (paso 2) para poder evaluar una opción concreta.")
